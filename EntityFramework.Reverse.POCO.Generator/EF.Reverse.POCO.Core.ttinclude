@@ -6,8 +6,12 @@
 <#@ include file="EF6.Utility.CS.ttinclude"#>
 <#@ assembly name="System.Configuration" #>
 <#@ assembly name="System.Windows.Forms" #>
+<#@ assembly name="System.Data.SQLite" #>
+<#@ assembly name="System.Data.SQLite.EF6" #>
+<#@ assembly name="System.Data.SQLite.Linq" #>
 <#@ import namespace="System.Data" #>
 <#@ import namespace="System.Data.SqlClient" #>
+<#@ import namespace="System.Data.SQLite" #>
 <#@ import namespace="System.Data.Common" #>
 <#@ import namespace="System.Data.Entity.Infrastructure.Pluralization" #>
 <#@ import namespace="System.Text.RegularExpressions" #>
@@ -105,6 +109,7 @@
         public static bool UseMappingTables;
         public static bool UsePropertyInitializers;
         public static bool IsSqlCe;
+        public static bool IsSqlite;
         public static string FileExtension = ".cs";
         public static bool UsePascalCase;
         public static bool UsePrivateSetterForComputedColumns;
@@ -697,6 +702,13 @@
         return false;
     }
 
+    private bool IsSqliteConnection(DbConnection connection)
+    {
+        if(connection.GetType().Name.ToLower() == "sqliteconnection")
+            return true;
+        return false;
+    }
+
     private Tables LoadTables(DbProviderFactory factory)
     {
         if(factory == null || !(Settings.ElementsToGenerate.HasFlag(Elements.Poco) ||
@@ -716,11 +728,17 @@
                 conn.Open();
 
                 Settings.IsSqlCe = IsSqlCeConnection(conn);
+                Settings.IsSqlite = IsSqliteConnection(conn);
 
                 if(Settings.IsSqlCe)
                     Settings.PrependSchemaName = false;
+				
+				SchemaReader reader;
+				if(Settings.IsSqlite)
+					reader = new SqliteSchemaReader(conn, factory) { Outer = this };
+				else
+					reader = new SqlServerSchemaReader(conn, factory) { Outer = this };
 
-                var reader = new SqlServerSchemaReader(conn, factory) { Outer = this };
                 var tables = reader.ReadSchema();
                 var fkList = reader.ReadForeignKeys();
                 reader.IdentifyForeignKeys(fkList, tables);
@@ -826,7 +844,7 @@
                 conn.ConnectionString = Settings.ConnectionString;
                 conn.Open();
 
-                if (Settings.IsSqlCe)
+                if (Settings.IsSqlCe || Settings.IsSqlite)
                     return new List<StoredProcedure>();
 
                 var reader = new SqlServerSchemaReader(conn, factory) { Outer = this };
@@ -3738,6 +3756,561 @@ SELECT  SERVERPROPERTY('Edition') AS Edition,
             return sysType;
         }
     }
+
+	private class SqliteSchemaReader : SchemaReader
+    {
+        private const string TableSQL = @"
+select type, name
+from sqlite_master
+where type in ('table', 'view')
+and name not like 'sqlite_%'";
+
+        public SqliteSchemaReader(DbConnection connection, DbProviderFactory factory)
+            : base(connection, factory)
+        {
+        }
+
+        private void WriteConnectionSettingComments()
+        {
+            if (!Settings.IncludeConnectionSettingComments)
+                return;
+
+            WriteLine("// Database Edition : Sqlite");
+            WriteLine("");
+        }
+
+        public override Tables ReadSchema()
+        {
+            WriteConnectionSettingComments();
+
+            var result = new Tables();
+            if (Cmd == null)
+                return result;
+
+            Cmd.CommandText = TableSQL;
+            using (var reader = Cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    var tableName = reader["name"].ToString().Trim();
+                    if (IsFilterExcluded(Settings.TableFilterExclude, Settings.TableFilterInclude, tableName))
+                        continue;
+
+                    var tableType = ((string)reader["type"]).Trim();
+
+                    var table = new Table
+                    {
+                        Name = tableName,
+                        Schema = string.Empty, //SQLite does not support multiple schemas
+                        IsView = string.Compare(tableType, "view", StringComparison.OrdinalIgnoreCase) == 0,
+                        TemporalType = TableTemporalType.None
+                    };
+
+                    if (!Settings.IncludeViews && table.IsView)
+                        continue;
+
+                    tableName = Settings.TableRename(tableName, string.Empty, table.IsView);
+                    if (IsFilterExcluded(Settings.TableFilterExclude, null, tableName)) // Retest exclusion filter after table rename
+                        continue;
+
+                    // Handle table names with underscores - singularise just the last word
+                    table.ClassName = Inflector.MakeSingular(CleanUp(tableName));
+                    table.NameHumanCase =
+                        (Settings.UsePascalCase
+                            ? Inflector.ToTitleCase(table.ClassName)
+                            : table.ClassName)
+                        .Replace(" ", "").Replace("$", "").Replace(".", "");
+
+                    // Check for table or C# name clashes
+                    if (ReservedKeywords.Contains(table.NameHumanCase) ||
+                        (Settings.UsePascalCase &&
+                            result.Find(x => x.NameHumanCase == table.NameHumanCase) != null))
+                    {
+                        table.NameHumanCase += "1";
+                    }
+
+                    if (!Settings.TableFilter(table))
+                        continue;
+
+                    result.Add(table);
+                }
+            }
+
+            foreach (var table in result)
+                PopulateTableColumns(Cmd, table, ReadForeignKeys());
+
+            // Check for property name clashes in columns
+            foreach (Column c in result.SelectMany(tbl =>
+                tbl.Columns.Where(c => tbl.Columns.FindAll(x => x.NameHumanCase == c.NameHumanCase).Count > 1)))
+            {
+                int n = 1;
+                var original = c.NameHumanCase;
+                c.NameHumanCase = original + n++;
+
+                // Check if the above resolved the name clash, if not, use next value
+                while (c.ParentTable.Columns.Count(c2 => c2.NameHumanCase == c.NameHumanCase) > 1)
+                    c.NameHumanCase = original + n++;
+            }
+
+            ReadIndexes(result);
+
+            foreach (Table tbl in result)
+            {
+                if (tbl.IsView && Settings.ViewProcessing != null) Settings.ViewProcessing(tbl);
+                tbl.SetPrimaryKeys();
+                foreach (Column c in tbl.Columns)
+                    Settings.UpdateColumn(c, tbl);
+                tbl.Columns.ForEach(x => x.SetupEntityAndConfig());
+            }
+
+            return result;
+        }
+
+        public override List<ForeignKey> ReadForeignKeys()
+        {
+            var fkList = new List<ForeignKey>();
+            if (Cmd == null)
+                return fkList;
+
+            var tables = new List<string>();
+
+            Cmd.CommandText = TableSQL;
+            using (var reader = Cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                    tables.Add(reader["name"].ToString());
+            }
+
+            foreach (var table in tables)
+            {
+                Cmd.CommandText = $"pragma foreign_key_list({table})";
+                using (var reader = Cmd.ExecuteReader())
+                {
+                    while (reader.Read())
+                    {
+                        string fkTableName = table;
+                        string pkTableName = reader["table"].ToString();
+                        string fkColumn = reader["from"].ToString();
+                        string pkColumn = reader["to"].ToString();
+                        int fkId = (int)(long)reader["id"];
+                        int ordinal = (int)(long)reader["seq"];
+                        string deleteRule = ((string)reader["on_delete"]).Trim();
+                        bool cascadeOnDelete = string.Compare(deleteRule, "cascade", StringComparison.OrdinalIgnoreCase) == 0;
+                        bool isNotEnforced = false;
+
+                        // Constraints don't necessarily have names in SQLite
+                        // so we give them one based on their table and ID
+                        // allowing them to be used for reverse navigation
+                        string constraintName = $"fk_{fkTableName}_{fkId}";
+                        string pkTableNameFiltered = Settings.TableRename(pkTableName, string.Empty, false);
+
+                        var fk = new ForeignKey(fkTableName, string.Empty, pkTableName, string.Empty, fkColumn, pkColumn,
+                            constraintName, pkTableNameFiltered, ordinal, cascadeOnDelete, isNotEnforced);
+
+                        var filteredFk = Settings.ForeignKeyFilter(fk);
+                        if (filteredFk != null)
+                            fkList.Add(filteredFk);
+                    }
+                }
+            }
+
+            return fkList;
+        }
+
+        // When a table has no primary keys, all the NOT NULL columns are set as being the primary key.
+        // This function reads the unique indexes for a table, and correctly sets the columns being used as primary keys.
+        public override void ReadIndexes(Tables tables)
+        {
+
+        }
+
+        public override void ReadExtendedProperties(Tables tables, bool commentsInSummaryBlock)
+        {
+            //no extended properties in SQLite
+        }
+
+        public override List<StoredProcedure> ReadStoredProcs()
+        {
+            var result = new List<StoredProcedure>();
+            //no stored procedures in SQLite
+            return result;
+        }
+
+        public override void ProcessForeignKeys(List<ForeignKey> fkList, Tables tables, bool checkForFkNameClashes)
+        {
+            var constraints = fkList.Select(x => x.FkSchema + "." + x.ConstraintName).Distinct();
+            foreach (var constraint in constraints)
+            {
+                var foreignKeys = fkList
+                    .Where(x => string.Format("{0}.{1}", x.FkSchema, x.ConstraintName).Equals(constraint, StringComparison.InvariantCultureIgnoreCase))
+                    .ToList();
+
+                var foreignKey = foreignKeys.First();
+                Table fkTable = tables.GetTable(foreignKey.FkTableName, foreignKey.FkSchema);
+                if (fkTable == null || fkTable.IsMapping || !fkTable.HasForeignKey)
+                    continue;
+
+                Table pkTable = tables.GetTable(foreignKey.PkTableName, foreignKey.PkSchema);
+                if (pkTable == null || pkTable.IsMapping)
+                    continue;
+
+                var fkCols = foreignKeys.Select(x => new
+                {
+                    fk = x,
+                    col = fkTable.Columns.Find(n => string.Equals(n.Name, x.FkColumn, StringComparison.InvariantCultureIgnoreCase))
+                })
+                    .Where(x => x.col != null)
+                    .OrderBy(o => o.fk.Ordinal)
+                    .ToList();
+
+                if (!fkCols.Any())
+                    continue;
+
+                //if(EF6)
+                {
+                    // Check FK has same number of columns as the primary key it points to
+                    var pks = pkTable.PrimaryKeys.OrderBy(x => x.PropertyType).ThenBy(y => y.Name).ToArray();
+                    var cols = fkCols.Select(x => x.col).OrderBy(x => x.PropertyType).ThenBy(y => y.Name).ToArray();
+                    if (pks.Length != cols.Length)
+                        continue;
+
+                    // EF6 - Cannot have a FK to a non-primary key
+                    if (pks.Where((pk, ef6Check) => pk.PropertyType != cols[ef6Check].PropertyType).Any())
+                        continue;
+                }
+
+                var pkCols = foreignKeys.Select(x => pkTable.Columns.Find(n => string.Equals(n.Name, x.PkColumn, StringComparison.InvariantCultureIgnoreCase)))
+                                        .Where(x => x != null)
+                                        .OrderBy(o => o.Ordinal)
+                                        .ToList();
+
+                if (!pkCols.Any())
+                    continue;
+
+                var relationship = CalcRelationship(pkTable, fkTable, fkCols.Select(c => c.col).ToList(), pkCols);
+                if (relationship == Relationship.DoNotUse)
+                    continue;
+
+                if (fkCols.All(x => !x.col.IsNullable && !x.col.Hidden) && pkCols.All(x => x.IsPrimaryKey || x.IsUnique))
+                {
+                    foreach (var fk in fkCols)
+                        fk.fk.IncludeRequiredAttribute = true;
+                }
+
+                foreignKey = Settings.ForeignKeyProcessing(foreignKeys, fkTable, pkTable, fkCols.Any(x => x.col.IsNullable));
+
+                string pkTableHumanCaseWithSuffix = foreignKey.PkTableHumanCase(pkTable.Suffix);
+                string pkTableHumanCase = foreignKey.PkTableHumanCase(null);
+                string pkPropName = fkTable.GetUniqueColumnName(pkTableHumanCase, foreignKey, checkForFkNameClashes, true, Relationship.ManyToOne);
+                bool fkMakePropNameSingular = (relationship == Relationship.OneToOne);
+                string fkPropName = pkTable.GetUniqueColumnName(fkTable.NameHumanCase, foreignKey, checkForFkNameClashes, fkMakePropNameSingular, Relationship.OneToMany);
+
+                var dataAnnotation = string.Empty;
+                if (Settings.UseDataAnnotations)
+                {
+                    dataAnnotation = string.Format("[ForeignKey(\"{0}\"){1}] ",
+                        string.Join(", ", fkCols.Select(x => x.col.NameHumanCase).Distinct().ToArray()),
+                        foreignKey.IncludeRequiredAttribute ? ", Required" : string.Empty
+                    );
+
+                    if (!checkForFkNameClashes &&
+                        relationship == Relationship.OneToOne &&
+                        foreignKey.IncludeReverseNavigation &&
+                        fkCols.All(x => x.col.IsPrimaryKey))
+                    {
+                        var principalEndAttribute = string.Format("ForeignKey(\"{0}\")", pkPropName);
+                        foreach (var fk in fkCols)
+                        {
+                            if (!fk.col.DataAnnotations.Contains(principalEndAttribute))
+                                fk.col.DataAnnotations.Add(principalEndAttribute);
+                        }
+                    }
+                }
+
+                var fkd = new PropertyAndComments
+                {
+                    AdditionalDataAnnotations = Settings.ForeignKeyAnnotationsProcessing(fkTable, pkTable, pkPropName, fkPropName),
+                    Definition = string.Format("{0}public {1}{2} {3} {4}{5}", dataAnnotation,
+                        Table.GetLazyLoadingMarker(),
+                        pkTableHumanCaseWithSuffix,
+                        pkPropName,
+                        "{ get; set; }",
+                        Settings.IncludeComments != CommentsStyle.None ? " // " + foreignKey.ConstraintName : string.Empty),
+                    Comments = string.Format("Parent {0} pointed by [{1}].({2}) ({3})",
+                        pkTableHumanCase,
+                        fkTable.Name,
+                        string.Join(", ", fkCols.Select(x => "[" + x.col.NameHumanCase + "]").Distinct().ToArray()),
+                        foreignKey.ConstraintName)
+                };
+
+                var firstFKCol = fkCols.First();
+                firstFKCol.col.EntityFk.Add(fkd);
+
+                string manyToManyMapping, mapKey;
+                if (foreignKeys.Count > 1)
+                {
+                    manyToManyMapping = string.Format("c => new {{ {0} }}", string.Join(", ", fkCols.Select(x => "c." + x.col.NameHumanCase).Distinct().ToArray()));
+                    mapKey = string.Format("{0}", string.Join(",", fkCols.Select(x => "\"" + x.col.Name + "\"").Distinct().ToArray()));
+                }
+                else
+                {
+                    manyToManyMapping = string.Format("c => c.{0}", firstFKCol.col.NameHumanCase);
+                    mapKey = string.Format("\"{0}\"", firstFKCol.col.Name);
+                }
+
+                if (!Settings.UseDataAnnotations)
+                {
+                    List<Column> fkCols2 = fkCols.Select(c => c.col).ToList();
+
+                    string rel = GetRelationship(relationship, fkCols2, pkCols, pkPropName, fkPropName, manyToManyMapping, mapKey, foreignKey.CascadeOnDelete, foreignKey.IncludeReverseNavigation, foreignKey.IsNotEnforced);
+                    string com = Settings.IncludeComments != CommentsStyle.None ? " // " + foreignKey.ConstraintName : string.Empty;
+                    firstFKCol.col.ConfigFk.Add(string.Format("{0};{1}", rel, com));
+                }
+
+                if (foreignKey.IncludeReverseNavigation)
+                {
+                    pkTable.AddReverseNavigation(relationship, pkTableHumanCase, fkTable, fkPropName, string.Format("{0}.{1}", fkTable.Name, foreignKey.ConstraintName), foreignKeys);
+                }
+            }
+        }
+
+        public override void IdentifyForeignKeys(List<ForeignKey> fkList, Tables tables)
+        {
+            foreach (var foreignKey in fkList)
+            {
+                Table fkTable = tables.GetTable(foreignKey.FkTableName, foreignKey.FkSchema);
+                if (fkTable == null)
+                    continue;   // Could be filtered out
+
+                Table pkTable = tables.GetTable(foreignKey.PkTableName, foreignKey.PkSchema);
+                if (pkTable == null)
+                    continue;   // Could be filtered out
+
+                Column fkCol = fkTable.Columns.Find(n => string.Equals(n.Name, foreignKey.FkColumn, StringComparison.InvariantCultureIgnoreCase));
+                if (fkCol == null)
+                    continue;   // Could not find fk column
+
+                Column pkCol = pkTable.Columns.Find(n => string.Equals(n.Name, foreignKey.PkColumn, StringComparison.InvariantCultureIgnoreCase));
+                if (pkCol == null)
+                    continue;   // Could not find pk column
+
+                fkTable.HasForeignKey = true;
+            }
+        }
+
+        private static string GetRelationship(Relationship relationship, IList<Column> fkCols, IList<Column> pkCols, string pkPropName, string fkPropName, string manyToManyMapping, string mapKey, bool cascadeOnDelete, bool includeReverseNavigation, bool isNotEnforced)
+        {
+            string hasMethod = GetHasMethod(relationship, fkCols, pkCols, isNotEnforced);
+            string withMethod = GetWithMethod(relationship, fkCols, fkPropName, manyToManyMapping, mapKey, includeReverseNavigation);
+
+            return string.Format("{0}(a => a.{1}){2}{3}",
+                hasMethod,
+                pkPropName,
+                withMethod,
+                cascadeOnDelete ? string.Empty : ".WillCascadeOnDelete(false)");
+        }
+
+        // HasOptional
+        // HasRequired
+        // HasMany
+        private static string GetHasMethod(Relationship relationship, IList<Column> fkCols, IList<Column> pkCols, bool isNotEnforced)
+        {
+            bool withMany = (relationship == Relationship.ManyToOne || relationship == Relationship.ManyToMany);
+            bool fkIsNullable = fkCols.Any(c => c.IsNullable);
+            bool pkIsUnique = pkCols.Any(c => c.IsUnique || c.IsUniqueConstraint || c.IsPrimaryKey);
+
+            if (withMany || pkIsUnique)
+            {
+                if (fkIsNullable || isNotEnforced)
+                {
+                    return "HasOptional";
+                }
+                else
+                {
+                    return "HasRequired";
+                }
+            }
+            else
+            {
+                return "HasMany";
+            }
+
+        }
+
+        // WithOptional
+        // WithRequired
+        // WithMany
+        // WithRequiredPrincipal
+        // WithRequiredDependent
+        private static string GetWithMethod(Relationship relationship, IList<Column> fkCols, string fkPropName, string manyToManyMapping, string mapKey, bool includeReverseNavigation)
+        {
+            string withParam = includeReverseNavigation ? string.Format("b => b.{0}", fkPropName) : string.Empty;
+            switch (relationship)
+            {
+                case Relationship.OneToOne:
+                    return string.Format(".WithOptional({0})", withParam);
+
+                case Relationship.OneToMany:
+                    return string.Format(".WithRequiredDependent({0})", withParam);
+
+                case Relationship.ManyToOne:
+                    if (!fkCols.Any(c => c.Hidden))
+                        return string.Format(".WithMany({0}).HasForeignKey({1})", withParam, manyToManyMapping);   // Foreign Key Association
+                    return string.Format(".WithMany({0}).Map(c => c.MapKey({1}))", withParam, mapKey);  // Independent Association
+
+                case Relationship.ManyToMany:
+                    return string.Format(".WithMany({0}).HasForeignKey({1})", withParam, manyToManyMapping);
+
+                default:
+                    throw new ArgumentOutOfRangeException("relationship");
+            }
+        }
+
+        private static void PopulateTableColumns(DbCommand Cmd, Table table, List<ForeignKey> foreignKeys)
+        {
+            var rxClean = new Regex("^(event|Equals|GetHashCode|GetType|ToString|repo|Save|IsNew|Insert|Update|Delete|Exists|SingleOrDefault|Single|First|FirstOrDefault|Fetch|Page|Query)$");
+
+            Cmd.CommandText = $"select * from {table.Name} limit 1";
+            using (var reader = Cmd.ExecuteReader())
+            {
+                int rdrPko = 0;
+                var schema = reader.GetSchemaTable();
+
+                foreach (DataRow row in schema.Rows)
+                {
+                    string colname = row["ColumnName"].ToString().Trim();
+                    string typename = row["DataTypeName"].ToString().Trim().ToLower();
+                    int rdrScale = (row["NumericScale"] as int?) ?? 0;
+                    bool rdrIsNullable = (bool)row["AllowDBNull"];
+                    int rdrMaxLength = (int)row["ColumnSize"];
+                    int rdrPrecision = (row["NumericPrecision"] as int?) ?? 0;
+                    bool rdrIsIdentity = (bool)row["IsAutoIncrement"];
+                    bool rdrIsRowGuid = row["DataType"].ToString().Contains("Guid");
+                    bool rdrIsPk = (bool)row["IsKey"];
+                    bool rdrIsFk = foreignKeys.Any(fk => fk.FkTableName == table.Name && fk.FkColumn == colname);
+
+                    var col = new Column
+                    {
+                        Ordinal = (int)row["ColumnOrdinal"],
+                        Name = colname,
+                        IsNullable = rdrIsNullable,
+                        PropertyType = GetPropertyType(row["DataType"].ToString()),
+                        SqlPropertyType = typename,
+                        MaxLength = rdrMaxLength,
+                        Precision = rdrPrecision,
+                        Default = row["DefaultValue"].ToString().Trim(),
+                        Scale = rdrScale,
+
+                        IsIdentity = rdrIsIdentity,
+                        IsRowGuid = rdrIsRowGuid,
+                        IsUnique = (bool)row["IsUnique"] || rdrIsIdentity,
+                        IsRowVersion = (bool)row["IsRowVersion"],
+                        IsMaxLength = rdrMaxLength == int.MaxValue,
+
+                        IsPrimaryKey = rdrIsPk,
+                        PrimaryKeyOrdinal = rdrIsPk ? rdrPko++ : 0,
+                        IsForeignKey = rdrIsFk,
+                        ParentTable = table
+                    };
+
+                    var fullName = string.Format("{0}.{1}", table.Name, col.Name);
+                    if (Settings.ColumnFilterExclude != null && !col.IsPrimaryKey &&
+                        (Settings.ColumnFilterExclude.IsMatch(col.Name) || Settings.ColumnFilterExclude.IsMatch(fullName)))
+                        col.Hidden = true;
+
+                    // SQLite has no concept of unicode support so we set unicode true for
+                    // all non-string types to prevent .IsUnicode(false) from appearing in
+                    // configuration files as it is only valid on string types
+                    if (col.PropertyType != "string")
+                    {
+                        col.IsUnicode = true;
+
+                        // In SQLite the column length is its storage size meaning all columns types have length
+                        // values - we clear the length on types where its not relevant to avoid .MaxLength() in
+                        // Configuration files as it is only valid on string and array types
+                        if (col.PropertyType != "byte[]")
+                            col.MaxLength = 0;
+                    }
+
+                    col.CleanUpDefault();
+                    col.NameHumanCase = CleanUp(col.Name);
+                    col.NameHumanCase = rxClean.Replace(col.NameHumanCase, "_$1");
+
+                    if (ReservedKeywords.Contains(col.NameHumanCase))
+                        col.NameHumanCase = "@" + col.NameHumanCase;
+
+                    col.DisplayName = ToDisplayName(col.Name);
+
+                    var titleCase = (Settings.UsePascalCase
+                            ? Inflector.ToTitleCase(col.NameHumanCase)
+                            : col.NameHumanCase)
+                        .Replace(" ", "");
+                    if (titleCase != string.Empty)
+                        col.NameHumanCase = titleCase;
+
+                    // Make sure property name doesn't clash with class name
+                    if (col.NameHumanCase == table.NameHumanCase)
+                        col.NameHumanCase = col.NameHumanCase + "_";
+
+                    if (char.IsDigit(col.NameHumanCase[0]))
+                        col.NameHumanCase = "_" + col.NameHumanCase;
+
+                    table.HasNullableColumns |= col.IsNullable;
+
+                    table.Columns.Add(col);
+                }
+            }
+
+            // The schema meta information seems to never return
+            // the default value so we need to read it separately
+            Cmd.CommandText = $"pragma table_info({table.Name})";
+            using (var reader = Cmd.ExecuteReader())
+            {
+                while (reader.Read())
+                {
+                    if (reader["dflt_value"].Equals(DBNull.Value))
+                        continue;
+
+                    var ord = (int)(long)reader["cid"];
+                    var def = reader["dflt_value"].ToString();
+                    var col = table.GetColumn((string)reader["name"]);
+
+                    if (col != null)
+                        col.Default = GetDefaultValueString(col.PropertyType, def);
+                }
+            }
+        }
+
+        private static string GetPropertyType(string sysType)
+        {
+            switch (sysType)
+            {
+                case "System.Boolean": return "bool";
+                case "System.Byte": return "byte";
+                case "System.Byte[]": return "byte[]";
+                case "System.Int16": return "short";
+                case "System.Int32": return "int";
+                case "System.Int64": return "long";
+                case "System.String": return "string";
+                case "System.Decimal": return "decimal";
+                case "System.Double": return "double";
+                case "System.Object": return "object";
+                default: return sysType;
+            }
+        }
+
+        private static string GetDefaultValueString(string propType, string value)
+        {
+            switch (propType)
+            {
+                case "string": return $"\"{value}\"";
+                case "double": return $"{value}d";
+                case "decimal": return $"{value}m";
+                case "bool": return value == "0" || string.IsNullOrEmpty(value) ? "false" : "true";
+                default: return value;
+            }
+        }
+	}
 
     public class ForeignKey
     {
