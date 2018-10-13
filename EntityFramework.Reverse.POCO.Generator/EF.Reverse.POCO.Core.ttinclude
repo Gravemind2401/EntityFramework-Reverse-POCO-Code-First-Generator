@@ -3801,7 +3801,7 @@ and name not like 'sqlite_%'";
                     var table = new Table
                     {
                         Name = tableName,
-                        Schema = string.Empty, //SQLite does not support multiple schemas
+                        Schema = "main", // SQLite does not support multiple schemas - the default one is always "main"
                         IsView = string.Compare(tableType, "view", StringComparison.OrdinalIgnoreCase) == 0,
                         TemporalType = TableTemporalType.None
                     };
