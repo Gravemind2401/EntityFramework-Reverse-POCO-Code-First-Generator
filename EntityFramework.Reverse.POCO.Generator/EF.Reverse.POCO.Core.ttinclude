@@ -4198,7 +4198,7 @@ and name not like 'sqlite_%'";
                         SqlPropertyType = typename,
                         MaxLength = rdrMaxLength,
                         Precision = rdrPrecision,
-                        Default = row["DefaultValue"].ToString().Trim(),
+                        Default = string.Empty, //will be set later
                         Scale = rdrScale,
 
                         IsIdentity = rdrIsIdentity,
@@ -4232,7 +4232,6 @@ and name not like 'sqlite_%'";
                             col.MaxLength = 0;
                     }
 
-                    col.CleanUpDefault();
                     col.NameHumanCase = CleanUp(col.Name);
                     col.NameHumanCase = rxClean.Replace(col.NameHumanCase, "_$1");
 
@@ -4271,12 +4270,13 @@ and name not like 'sqlite_%'";
                     if (reader["dflt_value"].Equals(DBNull.Value))
                         continue;
 
-                    var ord = (int)(long)reader["cid"];
-                    var def = reader["dflt_value"].ToString();
                     var col = table.GetColumn((string)reader["name"]);
 
                     if (col != null)
-                        col.Default = GetDefaultValueString(col.PropertyType, def);
+					{
+                        col.Default = reader["dflt_value"].ToString();
+						col.CleanUpDefault();
+					}
                 }
             }
         }
@@ -4296,18 +4296,6 @@ and name not like 'sqlite_%'";
                 case "System.Double": return "double";
                 case "System.Object": return "object";
                 default: return sysType;
-            }
-        }
-
-        private static string GetDefaultValueString(string propType, string value)
-        {
-            switch (propType)
-            {
-                case "string": return $"\"{value}\"";
-                case "double": return $"{value}d";
-                case "decimal": return $"{value}m";
-                case "bool": return value == "0" || string.IsNullOrEmpty(value) ? "false" : "true";
-                default: return value;
             }
         }
 	}
