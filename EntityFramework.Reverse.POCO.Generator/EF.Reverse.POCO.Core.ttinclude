@@ -3759,6 +3759,8 @@ SELECT  SERVERPROPERTY('Edition') AS Edition,
 
 	private class SqliteSchemaReader : SchemaReader
     {
+		private const string MainSchema = "main"; // SQLite does not support multiple schemas - the default one is always "main"
+
         private const string TableSQL = @"
 select type, name
 from sqlite_master
@@ -3801,7 +3803,7 @@ and name not like 'sqlite_%'";
                     var table = new Table
                     {
                         Name = tableName,
-                        Schema = "main", // SQLite does not support multiple schemas - the default one is always "main"
+                        Schema = MainSchema,
                         IsView = string.Compare(tableType, "view", StringComparison.OrdinalIgnoreCase) == 0,
                         TemporalType = TableTemporalType.None
                     };
@@ -3809,7 +3811,7 @@ and name not like 'sqlite_%'";
                     if (!Settings.IncludeViews && table.IsView)
                         continue;
 
-                    tableName = Settings.TableRename(tableName, string.Empty, table.IsView);
+                    tableName = Settings.TableRename(tableName, MainSchema, table.IsView);
                     if (IsFilterExcluded(Settings.TableFilterExclude, null, tableName)) // Retest exclusion filter after table rename
                         continue;
 
@@ -3902,9 +3904,9 @@ and name not like 'sqlite_%'";
                         // so we give them one based on their table and ID
                         // allowing them to be used for reverse navigation
                         string constraintName = $"fk_{fkTableName}_{fkId}";
-                        string pkTableNameFiltered = Settings.TableRename(pkTableName, string.Empty, false);
+                        string pkTableNameFiltered = Settings.TableRename(pkTableName, MainSchema, false);
 
-                        var fk = new ForeignKey(fkTableName, string.Empty, pkTableName, string.Empty, fkColumn, pkColumn,
+                        var fk = new ForeignKey(fkTableName, MainSchema, pkTableName, MainSchema, fkColumn, pkColumn,
                             constraintName, pkTableNameFiltered, ordinal, cascadeOnDelete, isNotEnforced);
 
                         var filteredFk = Settings.ForeignKeyFilter(fk);
